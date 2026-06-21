@@ -1,0 +1,1443 @@
+(() => {
+  "use strict";
+
+  const WORLD_W = 256;
+  const WORLD_H = 256;
+  const TILE_PIXELS = 8;
+  const MAX_AGENTS = 500;
+  const SAVE_KEY = "divine-terrain-save-v1";
+
+  const Terrain = Object.freeze({
+    OCEAN: 0,
+    SHALLOW: 1,
+    SAND: 2,
+    GRASS: 3,
+    FOREST: 4,
+    MOUNTAIN: 5,
+    SNOW: 6,
+    DESERT: 7,
+    RIVER: 8,
+    LAVA: 9,
+    BURNED: 10
+  });
+
+  const TERRAIN = [
+    { name: "Ocean", color: "#0a4f9c", passable: false, land: false },
+    { name: "Shallow Water", color: "#2e8bd4", passable: false, land: false },
+    { name: "Sand", color: "#d8c06b", passable: true, land: true },
+    { name: "Grass", color: "#54a64a", passable: true, land: true },
+    { name: "Forest", color: "#22793a", passable: true, land: true },
+    { name: "Mountain", color: "#777777", passable: true, land: true },
+    { name: "Snow", color: "#e8f3ff", passable: true, land: true },
+    { name: "Desert", color: "#c99638", passable: true, land: true },
+    { name: "River", color: "#1f76cc", passable: true, land: true },
+    { name: "Lava", color: "#ee5a1f", passable: false, land: true },
+    { name: "Burned Land", color: "#3b3029", passable: true, land: true }
+  ];
+
+  const KINGDOM_COLORS = ["#e65a5a", "#5aa6e6", "#e6c85a", "#8de65a", "#c45ae6", "#e6865a", "#5ae6c4", "#ffffff"];
+  const SETTLEMENT_NAMES = ["Auralis", "Brightfen", "Stonebay", "Mossford", "Sunreach", "Emberfall", "Greendale", "Northmere", "Cloudrest", "Oakspire"];
+  const KINGDOM_NAMES = ["Dawn Crown", "River Pact", "Stone Banner", "Wild Court", "Ash Realm", "Golden Vale", "Iron Leaf", "Blue Crown"];
+
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const distSq = (ax, ay, bx, by) => {
+    const dx = ax - bx;
+    const dy = ay - by;
+    return dx * dx + dy * dy;
+  };
+
+  function hexToRgb(hex) {
+    const clean = hex.replace("#", "");
+    return [
+      parseInt(clean.slice(0, 2), 16),
+      parseInt(clean.slice(2, 4), 16),
+      parseInt(clean.slice(4, 6), 16)
+    ];
+  }
+
+  const TERRAIN_RGB = TERRAIN.map(t => hexToRgb(t.color));
+
+  class Random {
+    constructor(seed) {
+      this.seed = seed >>> 0;
+    }
+
+    next() {
+      this.seed += 0x6D2B79F5;
+      let t = this.seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    int(min, max) {
+      return Math.floor(this.next() * (max - min + 1)) + min;
+    }
+
+    chance(probability) {
+      return this.next() < probability;
+    }
+
+    choice(list) {
+      return list[Math.floor(this.next() * list.length)];
+    }
+  }
+
+  function hashNoise(ix, iy, seed) {
+    let h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(seed, 2246822519);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+  }
+
+  function smooth(t) {
+    return t * t * (3 - 2 * t);
+  }
+
+  function noise2(x, y, seed) {
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    const fx = smooth(x - ix);
+    const fy = smooth(y - iy);
+    const a = hashNoise(ix, iy, seed);
+    const b = hashNoise(ix + 1, iy, seed);
+    const c = hashNoise(ix, iy + 1, seed);
+    const d = hashNoise(ix + 1, iy + 1, seed);
+    return lerp(lerp(a, b, fx), lerp(c, d, fx), fy);
+  }
+
+  function fbm(x, y, seed) {
+    let total = 0;
+    let amp = 0.5;
+    let freq = 1;
+    let norm = 0;
+    for (let i = 0; i < 5; i++) {
+      total += noise2(x * freq, y * freq, seed + i * 97) * amp;
+      norm += amp;
+      amp *= 0.5;
+      freq *= 2;
+    }
+    return total / norm;
+  }
+
+  class World {
+    constructor(seed = Date.now()) {
+      this.seed = seed >>> 0;
+      this.rng = new Random(this.seed);
+      this.w = WORLD_W;
+      this.h = WORLD_H;
+      this.tiles = new Uint8Array(this.w * this.h);
+      this.fire = new Uint8Array(this.w * this.h);
+      this.elevation = new Float32Array(this.w * this.h);
+      this.agents = [];
+      this.buildings = [];
+      this.settlements = [];
+      this.kingdoms = [];
+      this.nextAgentId = 1;
+      this.nextSettlementId = 1;
+      this.nextKingdomId = 1;
+      this.year = 1;
+      this.tick = 0;
+      this.generate(this.seed);
+    }
+
+    idx(x, y) {
+      return y * this.w + x;
+    }
+
+    inBounds(x, y) {
+      return x >= 0 && y >= 0 && x < this.w && y < this.h;
+    }
+
+    get(x, y) {
+      x = Math.floor(x);
+      y = Math.floor(y);
+      if (!this.inBounds(x, y)) return Terrain.OCEAN;
+      return this.tiles[this.idx(x, y)];
+    }
+
+    set(x, y, terrain) {
+      x = Math.floor(x);
+      y = Math.floor(y);
+      if (!this.inBounds(x, y)) return;
+      const i = this.idx(x, y);
+      this.tiles[i] = terrain;
+      if (terrain === Terrain.OCEAN || terrain === Terrain.SHALLOW || terrain === Terrain.RIVER) this.fire[i] = 0;
+    }
+
+    generate(seed) {
+      this.seed = seed >>> 0;
+      this.rng = new Random(this.seed);
+      this.agents.length = 0;
+      this.buildings.length = 0;
+      this.settlements.length = 0;
+      this.kingdoms.length = 0;
+      this.nextAgentId = 1;
+      this.nextSettlementId = 1;
+      this.nextKingdomId = 1;
+      this.year = 1;
+      this.tick = 0;
+      this.fire.fill(0);
+
+      for (let y = 0; y < this.h; y++) {
+        for (let x = 0; x < this.w; x++) {
+          const nx = x / this.w - 0.5;
+          const ny = y / this.h - 0.5;
+          const dist = Math.sqrt(nx * nx + ny * ny) * 1.42;
+          const continent = fbm(x / 72, y / 72, seed + 10);
+          const detail = fbm(x / 24, y / 24, seed + 90);
+          const temp = clamp(1.08 - y / this.h + (fbm(x / 58, y / 58, seed + 230) - 0.5) * 0.35, 0, 1);
+          const moisture = fbm(x / 36, y / 36, seed + 420);
+          const elev = continent * 0.55 + detail * 0.38 - dist * 0.95 + 0.28;
+          const i = this.idx(x, y);
+          this.elevation[i] = elev;
+
+          let t = Terrain.GRASS;
+          if (elev < 0.18) t = Terrain.OCEAN;
+          else if (elev < 0.23) t = Terrain.SHALLOW;
+          else if (elev < 0.28) t = Terrain.SAND;
+          else if (elev > 0.76 && temp < 0.52) t = Terrain.SNOW;
+          else if (elev > 0.70) t = Terrain.MOUNTAIN;
+          else if (temp > 0.58 && moisture < 0.31) t = Terrain.DESERT;
+          else if (moisture > 0.61) t = Terrain.FOREST;
+          else t = Terrain.GRASS;
+          this.tiles[i] = t;
+        }
+      }
+
+      this.carveRivers();
+      this.seedLife();
+    }
+
+    carveRivers() {
+      const candidates = [];
+      for (let y = 10; y < this.h - 10; y += 3) {
+        for (let x = 10; x < this.w - 10; x += 3) {
+          const i = this.idx(x, y);
+          if (this.elevation[i] > 0.56 && TERRAIN[this.tiles[i]].land) candidates.push([x, y, this.elevation[i]]);
+        }
+      }
+      candidates.sort((a, b) => b[2] - a[2]);
+
+      for (let r = 0; r < Math.min(20, candidates.length); r++) {
+        if (!this.rng.chance(0.6)) continue;
+        let [x, y] = candidates[this.rng.int(0, Math.min(candidates.length - 1, 80))];
+        for (let step = 0; step < 80; step++) {
+          if (!this.inBounds(x, y)) break;
+          const current = this.get(x, y);
+          if (current === Terrain.OCEAN || current === Terrain.SHALLOW) break;
+          if (current !== Terrain.MOUNTAIN && current !== Terrain.SNOW && current !== Terrain.LAVA) {
+            this.set(x, y, Terrain.RIVER);
+            if (this.rng.chance(0.25)) this.set(x + this.rng.int(-1, 1), y + this.rng.int(-1, 1), Terrain.RIVER);
+          }
+          let bestX = x;
+          let bestY = y;
+          let bestScore = this.elevation[this.idx(x, y)];
+          for (let oy = -1; oy <= 1; oy++) {
+            for (let ox = -1; ox <= 1; ox++) {
+              if (!ox && !oy) continue;
+              const nx = x + ox;
+              const ny = y + oy;
+              if (!this.inBounds(nx, ny)) continue;
+              const score = this.elevation[this.idx(nx, ny)] + this.rng.next() * 0.03;
+              if (score < bestScore) {
+                bestScore = score;
+                bestX = nx;
+                bestY = ny;
+              }
+            }
+          }
+          if (bestX === x && bestY === y) {
+            x += this.rng.int(-1, 1);
+            y += this.rng.int(-1, 1);
+          } else {
+            x = bestX;
+            y = bestY;
+          }
+        }
+      }
+    }
+
+    seedLife() {
+      for (let i = 0; i < 45; i++) {
+        const p = this.randomLandTile();
+        if (p) this.addAgent("human", p.x, p.y);
+      }
+      for (let i = 0; i < 85; i++) {
+        const p = this.randomLandTile();
+        if (p) this.addAgent("animal", p.x, p.y);
+      }
+      for (let i = 0; i < 6; i++) {
+        const p = this.randomLandTile();
+        if (p) this.addAgent("monster", p.x, p.y);
+      }
+    }
+
+    randomLandTile() {
+      for (let tries = 0; tries < 2000; tries++) {
+        const x = this.rng.int(0, this.w - 1);
+        const y = this.rng.int(0, this.h - 1);
+        const t = this.get(x, y);
+        if (TERRAIN[t].passable && t !== Terrain.MOUNTAIN && t !== Terrain.SNOW && t !== Terrain.BURNED) return { x: x + 0.5, y: y + 0.5 };
+      }
+      return null;
+    }
+
+    isPassable(x, y, type = "human") {
+      const t = this.get(x, y);
+      if (t === Terrain.OCEAN || t === Terrain.SHALLOW || t === Terrain.LAVA) return false;
+      if (type === "animal" && (t === Terrain.MOUNTAIN || t === Terrain.SNOW || t === Terrain.BURNED)) return false;
+      return true;
+    }
+
+    addAgent(type, x, y) {
+      if (this.agents.length >= MAX_AGENTS) return null;
+      if (!this.isPassable(x, y, type)) return null;
+      const base = {
+        human: { hp: 100, hunger: 15, color: "#f6d7a7" },
+        animal: { hp: 55, hunger: 10, color: "#c18b55" },
+        monster: { hp: 170, hunger: 0, color: "#7d2bbd" }
+      }[type];
+
+      const agent = {
+        id: this.nextAgentId++,
+        type,
+        x,
+        y,
+        vx: 0,
+        vy: 0,
+        hp: base.hp,
+        maxHp: base.hp,
+        hunger: base.hunger,
+        age: 0,
+        state: "wander",
+        settlementId: null,
+        kingdomId: null,
+        cooldown: 0,
+        wanderAngle: this.rng.next() * Math.PI * 2,
+        color: base.color
+      };
+      this.agents.push(agent);
+      return agent;
+    }
+
+    removeDead() {
+      this.agents = this.agents.filter(a => a.hp > 0 && a.age < 14000 && a.hunger < 140);
+    }
+
+    update(dt) {
+      this.tick++;
+      this.year += dt * 0.035;
+      this.updateFire(dt);
+      this.updateAgents(dt);
+      if (this.tick % 18 === 0) this.updateSettlements();
+      if (this.tick % 55 === 0) this.updateDiplomacy();
+      this.removeDead();
+    }
+
+    updateFire(dt) {
+      const next = new Uint8Array(this.fire);
+      for (let y = 1; y < this.h - 1; y++) {
+        for (let x = 1; x < this.w - 1; x++) {
+          const i = this.idx(x, y);
+          const t = this.tiles[i];
+          if (t === Terrain.LAVA && this.rng.chance(0.06)) next[i] = 255;
+
+          if (this.fire[i] > 0) {
+            next[i] = Math.max(0, this.fire[i] - 2);
+            if (this.fire[i] < 50 && (t === Terrain.FOREST || t === Terrain.GRASS)) {
+              this.tiles[i] = Terrain.BURNED;
+            }
+
+            if (this.rng.chance(0.032)) {
+              const nx = x + this.rng.int(-1, 1);
+              const ny = y + this.rng.int(-1, 1);
+              const ni = this.idx(nx, ny);
+              const nt = this.tiles[ni];
+              if (nt === Terrain.FOREST || nt === Terrain.GRASS || nt === Terrain.DESERT) next[ni] = Math.max(next[ni], 210);
+            }
+          }
+        }
+      }
+      this.fire = next;
+    }
+
+    updateAgents(dt) {
+      for (const a of this.agents) {
+        a.age += dt;
+        a.cooldown = Math.max(0, a.cooldown - dt);
+
+        const tile = this.get(a.x, a.y);
+        const i = this.idx(Math.floor(a.x), Math.floor(a.y));
+        if (this.fire[i] > 0 || tile === Terrain.LAVA) a.hp -= (tile === Terrain.LAVA ? 35 : 10) * dt;
+
+        if (a.type === "human") this.updateHuman(a, dt);
+        else if (a.type === "animal") this.updateAnimal(a, dt);
+        else if (a.type === "monster") this.updateMonster(a, dt);
+      }
+    }
+
+    updateHuman(a, dt) {
+      a.hunger += dt * 1.6;
+      if (a.hunger > 95) a.hp -= dt * 6;
+      if (a.hunger < 30 && a.hp < a.maxHp) a.hp += dt * 2.5;
+
+      const settlement = this.getSettlement(a.settlementId);
+      if (!settlement) {
+        const near = this.findSettlementNear(a.x, a.y, 14);
+        if (near) {
+          a.settlementId = near.id;
+          a.kingdomId = near.kingdomId;
+        }
+      }
+
+      const monster = this.findNearestAgent("monster", a.x, a.y, 2.1);
+      if (monster && a.cooldown <= 0) {
+        monster.hp -= 14;
+        a.cooldown = 0.6;
+        a.state = "defend";
+        return;
+      }
+
+      const enemy = this.findEnemyHuman(a);
+      if (enemy && a.cooldown <= 0) {
+        enemy.hp -= 8;
+        a.cooldown = 0.75;
+        a.state = "fight";
+        this.moveToward(a, enemy.x, enemy.y, dt, 0.48);
+        return;
+      }
+
+      if (a.hunger > 65) {
+        const foodTile = this.findNearestTerrain(a.x, a.y, [Terrain.FOREST, Terrain.GRASS, Terrain.RIVER], 11);
+        if (foodTile) {
+          this.moveToward(a, foodTile.x + 0.5, foodTile.y + 0.5, dt, 0.8);
+          if (distSq(a.x, a.y, foodTile.x + 0.5, foodTile.y + 0.5) < 1.6) {
+            a.hunger = Math.max(0, a.hunger - 34);
+            if (settlement) settlement.food += 2;
+            if (this.get(foodTile.x, foodTile.y) === Terrain.FOREST && this.rng.chance(0.15)) this.set(foodTile.x, foodTile.y, Terrain.GRASS);
+          }
+          a.state = "forage";
+          return;
+        }
+      }
+
+      if (settlement) {
+        if (distSq(a.x, a.y, settlement.x, settlement.y) > settlement.radius * settlement.radius) {
+          this.moveToward(a, settlement.x, settlement.y, dt, 0.7);
+          a.state = "return";
+          return;
+        }
+
+        const t = this.get(a.x, a.y);
+        if (t === Terrain.FOREST && this.rng.chance(0.025)) {
+          settlement.wood += 1;
+          a.hunger = Math.max(0, a.hunger - 2);
+          if (this.rng.chance(0.25)) this.set(a.x, a.y, Terrain.GRASS);
+        } else if ((t === Terrain.MOUNTAIN || t === Terrain.SNOW) && this.rng.chance(0.015)) {
+          settlement.stone += 1;
+        } else if ((t === Terrain.GRASS || t === Terrain.RIVER) && this.rng.chance(0.02)) {
+          settlement.food += 1;
+        }
+      }
+
+      this.wander(a, dt, 0.65);
+      a.state = "wander";
+    }
+
+    updateAnimal(a, dt) {
+      a.hunger += dt * 0.7;
+      if (a.hunger > 100) a.hp -= dt * 5;
+      const t = this.get(a.x, a.y);
+      if ((t === Terrain.GRASS || t === Terrain.FOREST) && this.rng.chance(0.04)) {
+        a.hunger = Math.max(0, a.hunger - 18);
+      }
+      if (this.agents.length < MAX_AGENTS && a.age > 80 && a.hunger < 45 && this.rng.chance(0.0015)) {
+        this.addAgent("animal", a.x + this.rng.next() - 0.5, a.y + this.rng.next() - 0.5);
+      }
+      this.wander(a, dt, 0.9);
+    }
+
+    updateMonster(a, dt) {
+      const target = this.findNearestAgent("human", a.x, a.y, 12);
+      if (target) {
+        const d = distSq(a.x, a.y, target.x, target.y);
+        if (d < 1.7 && a.cooldown <= 0) {
+          target.hp -= 28;
+          a.cooldown = 0.8;
+          a.state = "attack";
+        } else {
+          this.moveToward(a, target.x, target.y, dt, 0.72);
+          a.state = "hunt";
+        }
+      } else {
+        this.wander(a, dt, 0.55);
+        a.state = "prowl";
+      }
+    }
+
+    wander(a, dt, speed) {
+      if (this.rng.chance(0.04)) a.wanderAngle += (this.rng.next() - 0.5) * 1.6;
+      this.moveBy(a, Math.cos(a.wanderAngle) * speed * dt * 5, Math.sin(a.wanderAngle) * speed * dt * 5);
+    }
+
+    moveToward(a, tx, ty, dt, speed) {
+      const dx = tx - a.x;
+      const dy = ty - a.y;
+      const d = Math.hypot(dx, dy) || 1;
+      this.moveBy(a, (dx / d) * speed * dt * 5.5, (dy / d) * speed * dt * 5.5);
+    }
+
+    moveBy(a, dx, dy) {
+      const nx = clamp(a.x + dx, 0.5, this.w - 0.5);
+      const ny = clamp(a.y + dy, 0.5, this.h - 0.5);
+      if (this.isPassable(nx, ny, a.type)) {
+        a.x = nx;
+        a.y = ny;
+      } else if (this.isPassable(a.x + dx, a.y, a.type)) {
+        a.x = clamp(a.x + dx, 0.5, this.w - 0.5);
+        a.wanderAngle += 0.9;
+      } else if (this.isPassable(a.x, a.y + dy, a.type)) {
+        a.y = clamp(a.y + dy, 0.5, this.h - 0.5);
+        a.wanderAngle -= 0.9;
+      } else {
+        a.wanderAngle += Math.PI * (0.35 + this.rng.next());
+      }
+    }
+
+    findNearestAgent(type, x, y, radius, predicate = null) {
+      let best = null;
+      let bestD = radius * radius;
+      for (const a of this.agents) {
+        if (a.type !== type) continue;
+        if (predicate && !predicate(a)) continue;
+        const d = distSq(x, y, a.x, a.y);
+        if (d < bestD) {
+          best = a;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    findEnemyHuman(a) {
+      if (!a.kingdomId) return null;
+      return this.findNearestAgent("human", a.x, a.y, 3, other => {
+        if (other.id === a.id || !other.kingdomId || other.kingdomId === a.kingdomId) return false;
+        const k = this.getKingdom(a.kingdomId);
+        return k && k.enemies.includes(other.kingdomId);
+      });
+    }
+
+    findNearestTerrain(x, y, terrainList, radius) {
+      let best = null;
+      let bestD = radius * radius;
+      const sx = Math.floor(x);
+      const sy = Math.floor(y);
+      for (let oy = -radius; oy <= radius; oy++) {
+        for (let ox = -radius; ox <= radius; ox++) {
+          const tx = sx + ox;
+          const ty = sy + oy;
+          if (!this.inBounds(tx, ty)) continue;
+          if (!terrainList.includes(this.get(tx, ty))) continue;
+          const d = ox * ox + oy * oy;
+          if (d < bestD) {
+            bestD = d;
+            best = { x: tx, y: ty };
+          }
+        }
+      }
+      return best;
+    }
+
+    getSettlement(id) {
+      return this.settlements.find(s => s.id === id) || null;
+    }
+
+    getKingdom(id) {
+      return this.kingdoms.find(k => k.id === id) || null;
+    }
+
+    findSettlementNear(x, y, radius) {
+      let best = null;
+      let bestD = radius * radius;
+      for (const s of this.settlements) {
+        const d = distSq(x, y, s.x, s.y);
+        if (d < bestD) {
+          best = s;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    updateSettlements() {
+      for (const a of this.agents) {
+        if (a.type !== "human") continue;
+        const s = this.getSettlement(a.settlementId);
+        if (!s || distSq(a.x, a.y, s.x, s.y) > (s.radius + 8) * (s.radius + 8)) {
+          const near = this.findSettlementNear(a.x, a.y, 16);
+          if (near) {
+            a.settlementId = near.id;
+            a.kingdomId = near.kingdomId;
+          }
+        }
+      }
+
+      const freeHumans = this.agents.filter(a => a.type === "human" && !a.settlementId);
+      for (const h of freeHumans) {
+        const cluster = freeHumans.filter(o => distSq(h.x, h.y, o.x, o.y) < 8 * 8);
+        const nearbySettlement = this.findSettlementNear(h.x, h.y, 20);
+        if (cluster.length >= 5 && !nearbySettlement) {
+          const s = this.createSettlement(h.x, h.y);
+          for (const member of cluster) {
+            member.settlementId = s.id;
+            member.kingdomId = s.kingdomId;
+          }
+          break;
+        }
+      }
+
+      for (const s of this.settlements) {
+        const members = this.agents.filter(a => a.type === "human" && a.settlementId === s.id);
+        s.population = members.length;
+        s.radius = clamp(7 + s.population * 0.55 + this.countSettlementBuildings(s.id) * 0.7, 7, 30);
+        if (s.population >= 13 && !s.kingdomId) this.createKingdom(s);
+        if (s.kingdomId) {
+          for (const a of members) a.kingdomId = s.kingdomId;
+        }
+        this.tryBuildHouse(s);
+      }
+
+      this.settlements = this.settlements.filter(s => s.population > 0 || this.tick < 100);
+    }
+
+    createSettlement(x, y) {
+      const name = this.rng.choice(SETTLEMENT_NAMES) + " " + this.nextSettlementId;
+      const settlement = {
+        id: this.nextSettlementId++,
+        name,
+        x,
+        y,
+        population: 0,
+        wood: 20,
+        food: 18,
+        stone: 4,
+        radius: 9,
+        kingdomId: null,
+        color: "#ddddcc"
+      };
+      this.settlements.push(settlement);
+      return settlement;
+    }
+
+    createKingdom(settlement) {
+      const color = KINGDOM_COLORS[(this.nextKingdomId - 1) % KINGDOM_COLORS.length];
+      const name = this.rng.choice(KINGDOM_NAMES) + " " + this.nextKingdomId;
+      const kingdom = { id: this.nextKingdomId++, name, color, enemies: [] };
+      this.kingdoms.push(kingdom);
+      settlement.kingdomId = kingdom.id;
+      settlement.color = color;
+      for (const a of this.agents) {
+        if (a.type === "human" && a.settlementId === settlement.id) a.kingdomId = kingdom.id;
+      }
+      return kingdom;
+    }
+
+    countSettlementBuildings(settlementId) {
+      return this.buildings.filter(b => b.settlementId === settlementId).length;
+    }
+
+    tryBuildHouse(s) {
+      const houseCount = this.countSettlementBuildings(s.id);
+      if (s.wood < 16 || s.food < 8 || houseCount >= Math.ceil(s.population / 3) + 1) return;
+      for (let tries = 0; tries < 25; tries++) {
+        const angle = this.rng.next() * Math.PI * 2;
+        const radius = 2 + this.rng.next() * Math.max(3, s.radius - 4);
+        const x = Math.floor(s.x + Math.cos(angle) * radius);
+        const y = Math.floor(s.y + Math.sin(angle) * radius);
+        if (!this.inBounds(x, y) || !this.isPassable(x, y) || this.get(x, y) === Terrain.RIVER) continue;
+        if (this.buildings.some(b => Math.abs(b.x - x) < 2 && Math.abs(b.y - y) < 2)) continue;
+        this.buildings.push({ x, y, type: "house", hp: 100, settlementId: s.id, kingdomId: s.kingdomId });
+        s.wood -= 16;
+        s.food -= 5;
+        break;
+      }
+    }
+
+    updateDiplomacy() {
+      if (this.kingdoms.length < 2) return;
+      for (const k of this.kingdoms) {
+        if (this.rng.chance(0.06)) {
+          const other = this.rng.choice(this.kingdoms.filter(o => o.id !== k.id));
+          if (other && !k.enemies.includes(other.id) && this.rng.chance(0.5)) {
+            k.enemies.push(other.id);
+            if (!other.enemies.includes(k.id)) other.enemies.push(k.id);
+          }
+        }
+        if (this.rng.chance(0.025) && k.enemies.length) {
+          const id = this.rng.choice(k.enemies);
+          k.enemies = k.enemies.filter(e => e !== id);
+          const other = this.getKingdom(id);
+          if (other) other.enemies = other.enemies.filter(e => e !== k.id);
+        }
+      }
+    }
+
+    serialize() {
+      return {
+        version: 1,
+        seed: this.seed,
+        year: this.year,
+        nextAgentId: this.nextAgentId,
+        nextSettlementId: this.nextSettlementId,
+        nextKingdomId: this.nextKingdomId,
+        tiles: Array.from(this.tiles),
+        fire: Array.from(this.fire),
+        elevation: Array.from(this.elevation),
+        agents: this.agents,
+        buildings: this.buildings,
+        settlements: this.settlements,
+        kingdoms: this.kingdoms
+      };
+    }
+
+    load(data) {
+      if (!data || data.version !== 1) throw new Error("Unsupported save file.");
+      this.seed = data.seed >>> 0;
+      this.rng = new Random(this.seed);
+      this.year = data.year || 1;
+      this.nextAgentId = data.nextAgentId || 1;
+      this.nextSettlementId = data.nextSettlementId || 1;
+      this.nextKingdomId = data.nextKingdomId || 1;
+      this.tiles = Uint8Array.from(data.tiles);
+      this.fire = Uint8Array.from(data.fire || new Array(this.w * this.h).fill(0));
+      this.elevation = Float32Array.from(data.elevation || new Array(this.w * this.h).fill(0.4));
+      this.agents = data.agents || [];
+      this.buildings = data.buildings || [];
+      this.settlements = data.settlements || [];
+      this.kingdoms = data.kingdoms || [];
+    }
+  }
+
+  const POWERS = [
+    { id: "paint-ocean", category: "Terrain", name: "Ocean", icon: "OC", help: "Paint deep ocean.", color: "#0a4f9c", action: "terrain", terrain: Terrain.OCEAN },
+    { id: "paint-sand", category: "Terrain", name: "Sand", icon: "SA", help: "Paint beaches and dunes.", color: "#d8c06b", action: "terrain", terrain: Terrain.SAND },
+    { id: "paint-grass", category: "Terrain", name: "Grass", icon: "GR", help: "Paint fertile grassland.", color: "#54a64a", action: "terrain", terrain: Terrain.GRASS },
+    { id: "paint-forest", category: "Terrain", name: "Forest", icon: "FO", help: "Paint dense forest.", color: "#22793a", action: "terrain", terrain: Terrain.FOREST },
+    { id: "paint-mountain", category: "Terrain", name: "Mountain", icon: "MT", help: "Paint stone mountains.", color: "#777777", action: "terrain", terrain: Terrain.MOUNTAIN },
+    { id: "paint-snow", category: "Terrain", name: "Snow", icon: "SN", help: "Paint cold snow.", color: "#e8f3ff", action: "terrain", terrain: Terrain.SNOW },
+    { id: "paint-lava", category: "Terrain", name: "Lava", icon: "LV", help: "Paint burning lava.", color: "#ee5a1f", action: "terrain", terrain: Terrain.LAVA },
+    { id: "raise", category: "Terrain", name: "Raise Land", icon: "UP", help: "Lift water and plains upward.", color: "#8f8f70", action: "raise" },
+    { id: "lower", category: "Terrain", name: "Lower Land", icon: "DN", help: "Sink land toward water.", color: "#4a76a8", action: "lower" },
+
+    { id: "spawn-human", category: "Life", name: "Human", icon: "HU", help: "Spawn a human.", color: "#f6d7a7", action: "spawn", type: "human" },
+    { id: "spawn-animal", category: "Life", name: "Animal", icon: "AN", help: "Spawn a wandering animal.", color: "#c18b55", action: "spawn", type: "animal" },
+    { id: "spawn-monster", category: "Life", name: "Monster", icon: "MO", help: "Spawn a hostile monster.", color: "#7d2bbd", action: "spawn", type: "monster" },
+    { id: "spawn-tree", category: "Life", name: "Trees", icon: "TR", help: "Grow forest tiles.", color: "#1e7034", action: "growForest" },
+
+    { id: "rain", category: "Nature", name: "Rain", icon: "RN", help: "Extinguish fire and cool land.", color: "#7cc7ff", action: "rain" },
+    { id: "grow", category: "Nature", name: "Grow Forest", icon: "GF", help: "Turn healthy land into forest.", color: "#36a84f", action: "growForest" },
+    { id: "heal", category: "Nature", name: "Heal Land", icon: "HL", help: "Restore burned land and hurt life.", color: "#a6f28c", action: "heal" },
+
+    { id: "lightning", category: "Destruction", name: "Lightning", icon: "LT", help: "Strike one point with fire.", color: "#f9f27d", action: "lightning" },
+    { id: "fire", category: "Destruction", name: "Fire", icon: "FI", help: "Start spreading fires.", color: "#ff6a28", action: "fire" },
+    { id: "meteor", category: "Destruction", name: "Meteor", icon: "ME", help: "Blast a crater and fires.", color: "#ff8c38", action: "meteor" },
+    { id: "explosion", category: "Destruction", name: "Explosion", icon: "EX", help: "Damage terrain, buildings, and life.", color: "#f5b14c", action: "explosion" },
+    { id: "earthquake", category: "Destruction", name: "Earthquake", icon: "EQ", help: "Shake and scar the ground.", color: "#c2a266", action: "earthquake" },
+    { id: "erase", category: "Destruction", name: "Erase Life", icon: "EL", help: "Remove creatures in the brush.", color: "#f0f0f0", action: "erase" },
+
+    { id: "found", category: "Civilization", name: "Found Town", icon: "FT", help: "Create a settlement from nearby humans.", color: "#dbcc92", action: "found" },
+    { id: "bless", category: "Civilization", name: "Bless Town", icon: "BT", help: "Give nearby settlements food and wood.", color: "#fff0a0", action: "bless" },
+    { id: "peace", category: "Civilization", name: "Peace Pulse", icon: "PP", help: "Reduce nearby kingdom wars.", color: "#b8e6ff", action: "peace" },
+
+    { id: "inspect", category: "Utility", name: "Inspect", icon: "IN", help: "Inspect a tile or creature.", color: "#bfc7d5", action: "inspect" },
+    { id: "save", category: "Utility", name: "Save", icon: "SV", help: "Save to localStorage.", color: "#75d184", action: "save" },
+    { id: "load", category: "Utility", name: "Load", icon: "LD", help: "Load from localStorage.", color: "#84a8ff", action: "load" }
+  ];
+
+  class Game {
+    constructor() {
+      this.canvas = document.getElementById("game");
+      this.ctx = this.canvas.getContext("2d");
+      this.minimap = document.getElementById("minimap");
+      this.minimapCtx = this.minimap.getContext("2d");
+      this.hud = document.getElementById("hud");
+      this.tooltip = document.getElementById("tooltip");
+      this.inspectPanel = document.getElementById("inspectPanel");
+      this.toastEl = document.getElementById("toast");
+
+      this.world = new World(Date.now());
+      this.camera = { x: 86, y: 74, zoom: 1.15 };
+      this.mouse = { x: 0, y: 0, tileX: 0, tileY: 0 };
+      this.keys = new Set();
+      this.paused = false;
+      this.speed = 1;
+      this.brush = 3;
+      this.category = "Terrain";
+      this.selectedPower = POWERS[2];
+      this.effects = [];
+      this.paintCooldown = 0;
+      this.last = performance.now();
+      this.accum = 0;
+      this.miniTimer = 0;
+
+      this.resize();
+      this.setupUI();
+      this.bindInput();
+      requestAnimationFrame(t => this.loop(t));
+      this.toast("Divine Terrain ready.");
+    }
+
+    resize() {
+      this.width = window.innerWidth;
+      this.height = window.innerHeight;
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      this.canvas.width = Math.floor(this.width * dpr);
+      this.canvas.height = Math.floor(this.height * dpr);
+      this.canvas.style.width = this.width + "px";
+      this.canvas.style.height = this.height + "px";
+      this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this.ctx.imageSmoothingEnabled = false;
+      this.minimap.width = WORLD_W;
+      this.minimap.height = WORLD_H;
+    }
+
+    setupUI() {
+      const left = document.getElementById("leftControls");
+      left.innerHTML = `
+        <button data-control="pause">Pause</button>
+        <button data-control="speed1">1x</button>
+        <button data-control="speed2">2x</button>
+        <button data-control="speed4">4x</button>
+        <button data-control="save">Save</button>
+        <button data-control="load">Load</button>
+        <button data-control="regen">Regenerate</button>
+        <label class="brush-label">Brush <input id="brushSize" type="range" min="1" max="12" value="${this.brush}"></label>
+      `;
+
+      left.querySelector('[data-control="pause"]').onclick = () => this.togglePause();
+      left.querySelector('[data-control="speed1"]').onclick = () => this.setSpeed(1);
+      left.querySelector('[data-control="speed2"]').onclick = () => this.setSpeed(2);
+      left.querySelector('[data-control="speed4"]').onclick = () => this.setSpeed(4);
+      left.querySelector('[data-control="save"]').onclick = () => this.save();
+      left.querySelector('[data-control="load"]').onclick = () => this.load();
+      left.querySelector('[data-control="regen"]').onclick = () => this.regenerate();
+      left.querySelector("#brushSize").oninput = e => {
+        this.brush = Number(e.target.value);
+        this.toast("Brush size " + this.brush);
+      };
+
+      const tabs = document.getElementById("tabs");
+      const categories = ["Terrain", "Life", "Nature", "Destruction", "Civilization", "Utility"];
+      tabs.innerHTML = "";
+      for (const cat of categories) {
+        const btn = document.createElement("button");
+        btn.textContent = cat;
+        btn.className = cat === this.category ? "active" : "";
+        btn.onclick = () => {
+          this.category = cat;
+          this.renderToolbar();
+        };
+        tabs.appendChild(btn);
+      }
+
+      this.renderToolbar();
+    }
+
+    renderToolbar() {
+      const tabs = document.getElementById("tabs");
+      for (const btn of tabs.children) btn.classList.toggle("active", btn.textContent === this.category);
+
+      const powers = document.getElementById("powers");
+      powers.innerHTML = "";
+      for (const power of POWERS.filter(p => p.category === this.category)) {
+        const btn = document.createElement("button");
+        btn.className = "power-button" + (this.selectedPower.id === power.id ? " selected" : "");
+        btn.innerHTML = `<span class="power-icon" style="background:${power.color}">${power.icon}</span><span>${power.name}</span>`;
+        btn.onmouseenter = () => this.showTooltip(power.help);
+        btn.onmouseleave = () => this.hideTooltip();
+        btn.onclick = () => {
+          this.selectedPower = power;
+          this.renderToolbar();
+          this.toast("Selected " + power.name);
+        };
+        powers.appendChild(btn);
+      }
+    }
+
+    bindInput() {
+      window.addEventListener("resize", () => this.resize());
+      window.addEventListener("keydown", e => {
+        this.keys.add(e.key.toLowerCase());
+        if (e.key === " ") {
+          e.preventDefault();
+          this.togglePause();
+        }
+        if (e.key === "1") this.setSpeed(1);
+        if (e.key === "2") this.setSpeed(2);
+        if (e.key === "3") this.setSpeed(3);
+        if (e.key === "4") this.setSpeed(4);
+        if (e.key.toLowerCase() === "r") this.regenerate();
+        if (e.key.toLowerCase() === "s") this.save();
+        if (e.key.toLowerCase() === "l") this.load();
+        if (e.key.toLowerCase() === "b") this.changeBrush(-1);
+        if (e.key.toLowerCase() === "n") this.changeBrush(1);
+        if (e.key === "Escape") this.inspectPanel.classList.remove("open");
+      });
+      window.addEventListener("keyup", e => this.keys.delete(e.key.toLowerCase()));
+
+      this.canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+      this.canvas.addEventListener("mousemove", e => {
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = e.clientX - rect.left;
+        this.mouse.y = e.clientY - rect.top;
+        const tile = this.screenToTile(this.mouse.x, this.mouse.y);
+        this.mouse.tileX = tile.x;
+        this.mouse.tileY = tile.y;
+
+        if (this.panning) {
+          const scale = TILE_PIXELS * this.camera.zoom;
+          this.camera.x -= (e.movementX || 0) / scale;
+          this.camera.y -= (e.movementY || 0) / scale;
+          this.clampCamera();
+        }
+
+        if (this.painting && this.paintCooldown <= 0) {
+          this.usePower(this.mouse.tileX, this.mouse.tileY);
+          this.paintCooldown = 0.035;
+        }
+
+        if (this.tooltip.classList.contains("show")) {
+          this.tooltip.style.left = e.clientX + 16 + "px";
+          this.tooltip.style.top = e.clientY + 16 + "px";
+        }
+      });
+
+      this.canvas.addEventListener("mousedown", e => {
+        if (e.button === 2) {
+          this.panning = true;
+          return;
+        }
+        if (e.button === 0) {
+          this.painting = true;
+          this.usePower(this.mouse.tileX, this.mouse.tileY);
+        }
+      });
+
+      window.addEventListener("mouseup", () => {
+        this.panning = false;
+        this.painting = false;
+      });
+
+      this.canvas.addEventListener("wheel", e => {
+        e.preventDefault();
+        const before = this.screenToWorld(this.mouse.x, this.mouse.y);
+        const factor = e.deltaY < 0 ? 1.12 : 0.89;
+        this.camera.zoom = clamp(this.camera.zoom * factor, 0.35, 5.2);
+        const after = this.screenToWorld(this.mouse.x, this.mouse.y);
+        this.camera.x += before.x - after.x;
+        this.camera.y += before.y - after.y;
+        this.clampCamera();
+      }, { passive: false });
+
+      this.minimap.addEventListener("click", e => {
+        const rect = this.minimap.getBoundingClientRect();
+        this.camera.x = ((e.clientX - rect.left) / rect.width) * WORLD_W - this.visibleTilesX() / 2;
+        this.camera.y = ((e.clientY - rect.top) / rect.height) * WORLD_H - this.visibleTilesY() / 2;
+        this.clampCamera();
+      });
+    }
+
+    loop(now) {
+      const dt = Math.min(0.1, (now - this.last) / 1000);
+      this.last = now;
+      this.paintCooldown = Math.max(0, this.paintCooldown - dt);
+      this.updateCamera(dt);
+
+      if (!this.paused) {
+        this.accum += dt * this.speed;
+        const step = 1 / 12;
+        while (this.accum >= step) {
+          this.world.update(step);
+          this.accum -= step;
+        }
+      }
+
+      this.effects = this.effects.filter(e => {
+        e.t += dt;
+        return e.t < e.dur;
+      });
+
+      this.render();
+      this.updateHUD();
+      this.miniTimer += dt;
+      if (this.miniTimer > 0.35) {
+        this.drawMinimap();
+        this.miniTimer = 0;
+      }
+
+      requestAnimationFrame(t => this.loop(t));
+    }
+
+    updateCamera(dt) {
+      const move = 42 * dt / this.camera.zoom;
+      if (this.keys.has("w")) this.camera.y -= move;
+      if (this.keys.has("s")) this.camera.y += move;
+      if (this.keys.has("a")) this.camera.x -= move;
+      if (this.keys.has("d")) this.camera.x += move;
+      this.clampCamera();
+    }
+
+    visibleTilesX() {
+      return this.width / (TILE_PIXELS * this.camera.zoom);
+    }
+
+    visibleTilesY() {
+      return this.height / (TILE_PIXELS * this.camera.zoom);
+    }
+
+    clampCamera() {
+      this.camera.x = clamp(this.camera.x, 0, WORLD_W - this.visibleTilesX());
+      this.camera.y = clamp(this.camera.y, 0, WORLD_H - this.visibleTilesY());
+    }
+
+    screenToWorld(px, py) {
+      const scale = TILE_PIXELS * this.camera.zoom;
+      return { x: this.camera.x + px / scale, y: this.camera.y + py / scale };
+    }
+
+    screenToTile(px, py) {
+      const p = this.screenToWorld(px, py);
+      return { x: Math.floor(p.x), y: Math.floor(p.y) };
+    }
+
+    tileToScreen(x, y) {
+      const scale = TILE_PIXELS * this.camera.zoom;
+      return { x: (x - this.camera.x) * scale, y: (y - this.camera.y) * scale };
+    }
+
+    usePower(tx, ty) {
+      if (!this.world.inBounds(tx, ty)) return;
+      const p = this.selectedPower;
+      if (p.action === "save") return this.save();
+      if (p.action === "load") return this.load();
+      if (p.action === "inspect") return this.inspect(tx, ty);
+
+      if (p.action === "spawn") {
+        const count = this.brush > 6 ? 3 : 1;
+        for (let i = 0; i < count; i++) {
+          const x = tx + 0.5 + (Math.random() - 0.5) * this.brush;
+          const y = ty + 0.5 + (Math.random() - 0.5) * this.brush;
+          this.world.addAgent(p.type, x, y);
+        }
+        this.addEffect("spark", tx + 0.5, ty + 0.5, 0.45);
+        return;
+      }
+
+      if (p.action === "lightning") {
+        this.damageCircle(tx, ty, Math.max(1, this.brush * 0.45), 85);
+        this.igniteCircle(tx, ty, 1);
+        this.addEffect("lightning", tx + 0.5, ty + 0.5, 0.45);
+        return;
+      }
+
+      if (p.action === "meteor") {
+        const r = this.brush + 3;
+        this.damageCircle(tx, ty, r, 145);
+        this.applyCircle(tx, ty, r, (x, y, d) => {
+          if (d < r * 0.42) this.world.set(x, y, Terrain.BURNED);
+          else if (Math.random() < 0.45) this.world.set(x, y, Terrain.SAND);
+          if (Math.random() < 0.25) this.world.fire[this.world.idx(x, y)] = 240;
+        });
+        this.addEffect("meteor", tx + 0.5, ty + 0.5, 0.8);
+        return;
+      }
+
+      if (p.action === "explosion") {
+        const r = this.brush + 1;
+        this.damageCircle(tx, ty, r, 100);
+        this.applyCircle(tx, ty, r, (x, y) => {
+          if (Math.random() < 0.35 && TERRAIN[this.world.get(x, y)].land) this.world.set(x, y, Terrain.BURNED);
+        });
+        this.addEffect("explosion", tx + 0.5, ty + 0.5, 0.55);
+        return;
+      }
+
+      if (p.action === "earthquake") {
+        this.damageCircle(tx, ty, this.brush + 4, 55);
+        this.applyCircle(tx, ty, this.brush + 4, (x, y) => {
+          if (Math.random() < 0.08) {
+            const t = this.world.get(x, y);
+            if (t === Terrain.GRASS || t === Terrain.FOREST || t === Terrain.DESERT) this.world.set(x, y, Terrain.MOUNTAIN);
+            else if (t === Terrain.MOUNTAIN && Math.random() < 0.4) this.world.set(x, y, Terrain.SAND);
+          }
+        });
+        this.addEffect("quake", tx + 0.5, ty + 0.5, 0.7);
+        return;
+      }
+
+      this.applyCircle(tx, ty, this.brush, (x, y) => this.applyBrushPower(p, x, y));
+    }
+
+    applyCircle(cx, cy, radius, fn) {
+      const r = Math.max(1, radius);
+      for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+        for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+          if (!this.world.inBounds(x, y)) continue;
+          const d = Math.hypot(x - cx, y - cy);
+          if (d <= r) fn(x, y, d);
+        }
+      }
+    }
+
+    applyBrushPower(p, x, y) {
+      const w = this.world;
+      const t = w.get(x, y);
+      if (p.action === "terrain") {
+        w.set(x, y, p.terrain);
+        if (p.terrain === Terrain.LAVA) w.fire[w.idx(x, y)] = 255;
+      } else if (p.action === "raise") {
+        const next = {
+          [Terrain.OCEAN]: Terrain.SHALLOW,
+          [Terrain.SHALLOW]: Terrain.SAND,
+          [Terrain.SAND]: Terrain.GRASS,
+          [Terrain.GRASS]: Terrain.FOREST,
+          [Terrain.FOREST]: Terrain.MOUNTAIN,
+          [Terrain.RIVER]: Terrain.GRASS
+        }[t];
+        if (next !== undefined) w.set(x, y, next);
+      } else if (p.action === "lower") {
+        const next = {
+          [Terrain.MOUNTAIN]: Terrain.GRASS,
+          [Terrain.SNOW]: Terrain.MOUNTAIN,
+          [Terrain.FOREST]: Terrain.GRASS,
+          [Terrain.GRASS]: Terrain.SAND,
+          [Terrain.DESERT]: Terrain.SAND,
+          [Terrain.SAND]: Terrain.SHALLOW,
+          [Terrain.SHALLOW]: Terrain.OCEAN,
+          [Terrain.BURNED]: Terrain.SAND
+        }[t];
+        if (next !== undefined) w.set(x, y, next);
+      } else if (p.action === "growForest") {
+        if ([Terrain.GRASS, Terrain.SAND, Terrain.DESERT, Terrain.BURNED].includes(t)) w.set(x, y, Terrain.FOREST);
+      } else if (p.action === "rain") {
+        w.fire[w.idx(x, y)] = 0;
+        if (t === Terrain.LAVA && Math.random() < 0.2) w.set(x, y, Terrain.MOUNTAIN);
+        if (t === Terrain.DESERT && Math.random() < 0.02) w.set(x, y, Terrain.GRASS);
+      } else if (p.action === "heal") {
+        w.fire[w.idx(x, y)] = 0;
+        if (t === Terrain.BURNED || t === Terrain.DESERT) w.set(x, y, Terrain.GRASS);
+        for (const a of w.agents) {
+          if (distSq(a.x, a.y, x + 0.5, y + 0.5) < 2.5) {
+            a.hp = Math.min(a.maxHp, a.hp + 1.5);
+            a.hunger = Math.max(0, a.hunger - 0.8);
+          }
+        }
+      } else if (p.action === "fire") {
+        if (t !== Terrain.OCEAN && t !== Terrain.SHALLOW && t !== Terrain.RIVER) w.fire[w.idx(x, y)] = 240;
+      } else if (p.action === "erase") {
+        w.agents = w.agents.filter(a => distSq(a.x, a.y, x + 0.5, y + 0.5) > 1.2);
+      } else if (p.action === "found") {
+        this.foundSettlement(x, y);
+      } else if (p.action === "bless") {
+        const s = w.findSettlementNear(x, y, this.brush + 8);
+        if (s) {
+          s.food += 20;
+          s.wood += 20;
+          s.stone += 6;
+          this.addEffect("spark", s.x, s.y, 0.7);
+        }
+      } else if (p.action === "peace") {
+        for (const k of w.kingdoms) if (Math.random() < 0.5) k.enemies.length = 0;
+        this.addEffect("spark", x + 0.5, y + 0.5, 0.7);
+      }
+    }
+
+    foundSettlement(x, y) {
+      const existing = this.world.findSettlementNear(x, y, 12);
+      if (existing) return;
+      const nearby = this.world.agents.filter(a => a.type === "human" && distSq(a.x, a.y, x + 0.5, y + 0.5) < 8 * 8);
+      if (nearby.length < 3) {
+        for (let i = 0; i < 5; i++) this.world.addAgent("human", x + 0.5 + Math.random() * 4 - 2, y + 0.5 + Math.random() * 4 - 2);
+      }
+      const s = this.world.createSettlement(x + 0.5, y + 0.5);
+      for (const a of this.world.agents) {
+        if (a.type === "human" && distSq(a.x, a.y, s.x, s.y) < 10 * 10) a.settlementId = s.id;
+      }
+      this.addEffect("spark", s.x, s.y, 0.8);
+    }
+
+    damageCircle(cx, cy, radius, amount) {
+      for (const a of this.world.agents) {
+        const d = Math.sqrt(distSq(a.x, a.y, cx + 0.5, cy + 0.5));
+        if (d <= radius) a.hp -= amount * (1 - d / (radius + 0.001));
+      }
+      for (const b of this.world.buildings) {
+        const d = Math.sqrt(distSq(b.x + 0.5, b.y + 0.5, cx + 0.5, cy + 0.5));
+        if (d <= radius) b.hp -= amount * (1 - d / (radius + 0.001));
+      }
+      this.world.buildings = this.world.buildings.filter(b => b.hp > 0);
+    }
+
+    igniteCircle(cx, cy, radius) {
+      this.applyCircle(cx, cy, radius, (x, y) => {
+        const t = this.world.get(x, y);
+        if (t !== Terrain.OCEAN && t !== Terrain.SHALLOW && t !== Terrain.RIVER) {
+          this.world.fire[this.world.idx(x, y)] = 255;
+        }
+      });
+    }
+
+    inspect(x, y) {
+      const t = this.world.get(x, y);
+      const i = this.world.idx(x, y);
+      const agents = this.world.agents.filter(a => distSq(a.x, a.y, x + 0.5, y + 0.5) < 9);
+      const settlement = this.world.findSettlementNear(x, y, 12);
+      const agentText = agents.slice(0, 6).map(a => `${a.type} hp ${Math.round(a.hp)} hunger ${Math.round(a.hunger)}`).join("<br>") || "None nearby";
+      const settlementText = settlement
+        ? `${settlement.name}<br>Pop ${settlement.population} | Food ${settlement.food} | Wood ${settlement.wood} | Stone ${settlement.stone}`
+        : "None nearby";
+
+      this.inspectPanel.innerHTML = `
+        <button class="close-panel">×</button>
+        <h3>Inspect Tile</h3>
+        <p><b>Position:</b> ${x}, ${y}</p>
+        <p><b>Terrain:</b> ${TERRAIN[t].name}</p>
+        <p><b>Elevation:</b> ${this.world.elevation[i].toFixed(2)}</p>
+        <p><b>Fire:</b> ${this.world.fire[i]}</p>
+        <p><b>Settlement:</b><br>${settlementText}</p>
+        <p><b>Life:</b><br>${agentText}</p>
+      `;
+      this.inspectPanel.querySelector(".close-panel").onclick = () => this.inspectPanel.classList.remove("open");
+      this.inspectPanel.classList.add("open");
+    }
+
+    addEffect(type, x, y, dur) {
+      this.effects.push({ type, x, y, t: 0, dur });
+    }
+
+    render() {
+      const ctx = this.ctx;
+      ctx.clearRect(0, 0, this.width, this.height);
+      ctx.fillStyle = "#071522";
+      ctx.fillRect(0, 0, this.width, this.height);
+
+      const scale = TILE_PIXELS * this.camera.zoom;
+      const startX = Math.max(0, Math.floor(this.camera.x) - 1);
+      const startY = Math.max(0, Math.floor(this.camera.y) - 1);
+      const endX = Math.min(WORLD_W, Math.ceil(this.camera.x + this.visibleTilesX()) + 1);
+      const endY = Math.min(WORLD_H, Math.ceil(this.camera.y + this.visibleTilesY()) + 1);
+
+      for (let y = startY; y < endY; y++) {
+        for (let x = startX; x < endX; x++) {
+          const t = this.world.get(x, y);
+          const px = Math.floor((x - this.camera.x) * scale);
+          const py = Math.floor((y - this.camera.y) * scale);
+          ctx.fillStyle = TERRAIN[t].color;
+          ctx.fillRect(px, py, Math.ceil(scale), Math.ceil(scale));
+
+          const fire = this.world.fire[this.world.idx(x, y)];
+          if (fire > 0) {
+            ctx.fillStyle = fire > 140 ? "#ff8a22" : "#b73418";
+            const pad = Math.max(1, scale * 0.18);
+            ctx.fillRect(px + pad, py + pad, Math.max(2, scale - pad * 2), Math.max(2, scale - pad * 2));
+          }
+        }
+      }
+
+      this.renderTerritory(ctx, scale);
+      this.renderBuildings(ctx, scale);
+      this.renderAgents(ctx, scale);
+      this.renderEffects(ctx, scale);
+      this.renderBrush(ctx, scale);
+    }
+
+    renderTerritory(ctx, scale) {
+      ctx.save();
+      ctx.globalAlpha = 0.13;
+      for (const s of this.world.settlements) {
+        const p = this.tileToScreen(s.x, s.y);
+        ctx.fillStyle = s.color || "#ffffff";
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, s.radius * scale, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    renderBuildings(ctx, scale) {
+      for (const b of this.world.buildings) {
+        const s = this.tileToScreen(b.x, b.y);
+        if (s.x < -20 || s.y < -20 || s.x > this.width + 20 || s.y > this.height + 20) continue;
+        const kingdom = this.world.getKingdom(b.kingdomId);
+        ctx.fillStyle = "#4c3425";
+        ctx.fillRect(Math.floor(s.x + scale * 0.12), Math.floor(s.y + scale * 0.28), Math.ceil(scale * 0.76), Math.ceil(scale * 0.56));
+        ctx.fillStyle = kingdom ? kingdom.color : "#d8b46a";
+        ctx.fillRect(Math.floor(s.x + scale * 0.24), Math.floor(s.y + scale * 0.12), Math.ceil(scale * 0.52), Math.ceil(scale * 0.25));
+      }
+    }
+
+    renderAgents(ctx, scale) {
+      for (const a of this.world.agents) {
+        const s = this.tileToScreen(a.x, a.y);
+        if (s.x < -20 || s.y < -20 || s.x > this.width + 20 || s.y > this.height + 20) continue;
+
+        if (a.type === "human") {
+          const kingdom = this.world.getKingdom(a.kingdomId);
+          const size = Math.max(3, scale * 0.42);
+          ctx.fillStyle = kingdom ? kingdom.color : "#3c5270";
+          ctx.fillRect(Math.floor(s.x - size / 2), Math.floor(s.y), Math.ceil(size), Math.ceil(size * 0.8));
+          ctx.fillStyle = a.color;
+          ctx.fillRect(Math.floor(s.x - size * 0.35), Math.floor(s.y - size * 0.55), Math.ceil(size * 0.7), Math.ceil(size * 0.55));
+        } else if (a.type === "animal") {
+          const size = Math.max(3, scale * 0.42);
+          ctx.fillStyle = a.color;
+          ctx.fillRect(Math.floor(s.x - size / 2), Math.floor(s.y - size / 4), Math.ceil(size), Math.ceil(size * 0.58));
+          ctx.fillRect(Math.floor(s.x + size * 0.22), Math.floor(s.y - size * 0.55), Math.ceil(size * 0.38), Math.ceil(size * 0.35));
+        } else {
+          const size = Math.max(4, scale * 0.58);
+          ctx.fillStyle = "#2a123d";
+          ctx.fillRect(Math.floor(s.x - size / 2), Math.floor(s.y - size / 2), Math.ceil(size), Math.ceil(size));
+          ctx.fillStyle = a.color;
+          ctx.fillRect(Math.floor(s.x - size * 0.34), Math.floor(s.y - size * 0.72), Math.ceil(size * 0.68), Math.ceil(size * 0.45));
+          ctx.fillStyle = "#ff664a";
+          ctx.fillRect(Math.floor(s.x - 1), Math.floor(s.y - size * 0.6), 2, 2);
+        }
+      }
+    }
+
+    renderEffects(ctx, scale) {
+      ctx.save();
+      for (const e of this.effects) {
+        const p = this.tileToScreen(e.x, e.y);
+        const life = e.t / e.dur;
+        ctx.globalAlpha = 1 - life;
+        if (e.type === "lightning") {
+          ctx.strokeStyle = "#fff38c";
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(p.x, 0);
+          ctx.lineTo(p.x - 16, p.y - 20);
+          ctx.lineTo(p.x + 9, p.y);
+          ctx.stroke();
+        } else {
+          ctx.strokeStyle = e.type === "meteor" ? "#ff8a38" : e.type === "quake" ? "#d1b06f" : "#ffe18a";
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, (8 + life * 40) * this.camera.zoom, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    renderBrush(ctx, scale) {
+      if (!this.world.inBounds(this.mouse.tileX, this.mouse.tileY)) return;
+      const p = this.tileToScreen(this.mouse.tileX + 0.5, this.mouse.tileY + 0.5);
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, this.brush * scale, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    drawMinimap() {
+      const img = this.minimapCtx.createImageData(WORLD_W, WORLD_H);
+      for (let i = 0; i < this.world.tiles.length; i++) {
+        const rgb = TERRAIN_RGB[this.world.tiles[i]];
+        img.data[i * 4] = rgb[0];
+        img.data[i * 4 + 1] = rgb[1];
+        img.data[i * 4 + 2] = rgb[2];
+        img.data[i * 4 + 3] = 255;
+      }
+      this.minimapCtx.putImageData(img, 0, 0);
+      this.minimapCtx.strokeStyle = "#ffffff";
+      this.minimapCtx.lineWidth = 2;
+      this.minimapCtx.strokeRect(this.camera.x, this.camera.y, this.visibleTilesX(), this.visibleTilesY());
+    }
+
+    updateHUD() {
+      const humans = this.world.agents.filter(a => a.type === "human").length;
+      const animals = this.world.agents.filter(a => a.type === "animal").length;
+      const monsters = this.world.agents.filter(a => a.type === "monster").length;
+      this.hud.innerHTML = `
+        <div><b>Divine Terrain</b></div>
+        <div>Year ${Math.floor(this.world.year)} | ${this.paused ? "Paused" : this.speed + "x"}</div>
+        <div>Humans ${humans} | Animals ${animals} | Monsters ${monsters}</div>
+        <div>Settlements ${this.world.settlements.length} | Kingdoms ${this.world.kingdoms.length}</div>
+        <div>Tool ${this.selectedPower.name} | Brush ${this.brush}</div>
+      `;
+    }
+
+    togglePause() {
+      this.paused = !this.paused;
+      const btn = document.querySelector('[data-control="pause"]');
+      if (btn) btn.textContent = this.paused ? "Play" : "Pause";
+      this.toast(this.paused ? "Paused." : "Playing.");
+    }
+
+    setSpeed(speed) {
+      this.speed = speed;
+      this.paused = false;
+      const btn = document.querySelector('[data-control="pause"]');
+      if (btn) btn.textContent = "Pause";
+      this.toast("Speed " + speed + "x");
+    }
+
+    changeBrush(delta) {
+      this.brush = clamp(this.brush + delta, 1, 12);
+      const slider = document.getElementById("brushSize");
+      if (slider) slider.value = this.brush;
+      this.toast("Brush size " + this.brush);
+    }
+
+    regenerate() {
+      this.world = new World(Date.now());
+      this.inspectPanel.classList.remove("open");
+      this.toast("New world generated.");
+    }
+
+    save() {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(this.world.serialize()));
+      this.toast("World saved.");
+    }
+
+    load() {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) {
+        this.toast("No saved world found.");
+        return;
+      }
+      try {
+        this.world.load(JSON.parse(raw));
+        this.toast("World loaded.");
+      } catch (err) {
+        console.error(err);
+        this.toast("Save could not be loaded.");
+      }
+    }
+
+    showTooltip(text) {
+      this.tooltip.textContent = text;
+      this.tooltip.classList.add("show");
+    }
+
+    hideTooltip() {
+      this.tooltip.classList.remove("show");
+    }
+
+    toast(message) {
+      this.toastEl.textContent = message;
+      this.toastEl.classList.add("show");
+      clearTimeout(this.toastTimer);
+      this.toastTimer = setTimeout(() => this.toastEl.classList.remove("show"), 1500);
+    }
+  }
+
+  window.addEventListener("DOMContentLoaded", () => new Game());
+})();
